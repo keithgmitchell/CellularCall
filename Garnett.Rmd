@@ -1,0 +1,258 @@
+---
+title: "garnett"
+author: "Keith Mitchell"
+date: "1/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Load Packages and do some preprocessing
+```{r echo=FALSE}
+library(Seurat)
+library(ggplot2)
+library(magrittr)
+library(dplyr)
+library(kableExtra)
+library(DT)
+library(reticulate)
+```
+
+## Process the Markers file for use in Garnett
+```{r}
+# import pandas as pd
+# data = pd.read_csv('DL_Manual2.csv')
+# data
+```
+
+## Custom function for taking marker file from researcher and processing to create the file that Garnett takes in
+- Link to google doc where this is being updated see DL Manual Tab: [Google Sheets updated by researcher](https://docs.google.com/spreadsheets/d/1JgTbmvAGOXy257Vlxq2I6Va8nY0beHbF_RpwOqZejpc/edit?usp=sharing)
+```{r}
+
+# def Diff(li1, li2):
+#     return (list(list(set(li1)-set(li2)) + list(set(li2)-set(li1))))
+#  
+# 
+# data.columns
+# with open('auto_process.txt', 'w') as auto:
+#   for cell in data.columns:
+#     print(cell)
+#     all_list = [i for i in data[cell] if type(i)==str]
+#     neg_list = [i for i in all_list if '-' in i and '+' not in i]
+#     pos_list = [i for i in Diff(all_list, neg_list)]
+#     neg_list = [i[:-1] for i in neg_list ]
+#     pos_list = [i[:-1] for i in pos_list]
+#     auto.write('>' + cell + '\n')
+#     auto.write('expressed: ' + ', '.join([i[0]+i[1:].lower() for i in pos_list]) + '\n')
+#     if len(neg_list):
+#       auto.write('not expressed: ' + ', '.join([i[0]+i[1:].lower() for i in neg_list]) + '\n')
+#     
+```
+
+
+## Read in the data object processed in Seurat Part 1 to Part 4
+- This data is also hosted here for further exploration: [Shiny App](http://ec2-54-219-38-77.us-west-1.compute.amazonaws.com:3838/scRNA_shiny/)
+```{r}
+aggregate <- readRDS('Haudenschild_scRNASeqfromapp.rds')
+```
+
+
+## Lets look at the resolution that has been important so far and get familiar with the Seurat object
+```{r}
+p <- DimPlot(aggregate, group.by = paste0("RNA_snn_res.", 0.06), label = T, reduction = "umap")
+print(p)
+
+```
+
+
+# GARNETT
+```{r echo=FALSE}
+library(org.Hs.eg.db)
+library(org.Mm.eg.db)
+
+library(Seurat)
+library(SeuratWrappers)
+library(monocle3)
+library(Matrix)
+library(ggplot2)
+library(patchwork)
+library(garnett)
+agg.cds <- as.cell_data_set(aggregate)
+#agg.cds <- cluster_cells(cds = agg.cds, reduction_method = "UMAP")
+
+#marker_file_path <- system.file("extdata", "pbmc_bad_markers.txt",
+                                #package = "garnett")
+marker_file_path <- "auto_process.txt"
+agg.cds <- reduce_dimension(agg.cds)
+#cluster_cells(agg.cds, reduction_method = "UMAP")
+```
+## Lets check out the marker file to see what it looks like
+
+- developing b cells subtype of b-cells
+- rag1 and rag2 > changes to receptors
+- T cells > cd4 and cd8 (cd4 not here?)
+
+```{bash}
+head auto_process.txt
+```
+
+
+## Check the markers 
+```{r}
+agg.cds <- estimate_size_factors(agg.cds)
+marker_check <- check_markers(agg.cds, marker_file_path,
+                              db=org.Mm.eg.db,
+                              cds_gene_id_type = "SYMBOL",
+                              marker_file_gene_id_type = "SYMBOL")
+
+plot_markers(marker_check)
+```
+
+## Output the markers for the researcher to evaluate and continue iterations to improve.
+```{r}
+write.csv(marker_check,'markers_summary.txt')
+marker_check
+```
+
+## Filter for markers that are OK 
+####```{r}
+####marker_check = marker_check[marker_check$summary=="Ok" ,]
+####marker_check = filter(marker_check, grepl("Ok",summary))
+####datatable(marker_check)
+```
+
+## Train the classifier based on the marker genes and subsetting our dataset.
+```{r}
+pbmc_classifier <- train_cell_classifier(cds = agg.cds,
+                                         marker_file = marker_file_path,
+                                         db=org.Mm.eg.db,
+                                         num_unknown = 500,
+                                         min_observations = 1,
+                                         max_training_samples = 500,
+                                         cds_gene_id_type = "SYMBOL",
+                                         marker_file_gene_id_type = "SYMBOL")
+#                     tsne_1    tsne_2 Size_Factor FACS_type
+# AAGCACTGCACACA-1  3.840315 12.084191   0.5591814   B cells
+# GGCTCACTGGTCTA-1  9.970962  3.505393   0.5159340   B cells
+# AGCACTGATATCTC-1  3.459529  4.935273   0.6980284   B cells
+# ACACGTGATATTCC-1  1.743949  7.782671   0.8156310   B cells
+# ATATGCCTCTGCAA-1  5.783448  8.558898   1.1153280   B cells
+# TGACGAACCTATTC-1 10.792853 10.585274   0.6494699   B cells
+```
+
+## Lets look at the coeffecients of our model.
+- Todo explain the intercept better
+```{r}
+feature_genes <- get_feature_genes(pbmc_classifier,
+                                   node = "root",
+                                   db = org.Mm.eg.db,
+                                   convert_ids = TRUE)
+feature_genes 
+```
+## Lets make a table for the paper representing some examples 
+```{r}
+head(feature_genes, 15) %>% kable() %>% kable_styling() 
+
+```
+
+## Lets look at the coeffecients for the 1st cell along with the expressions for those coeffecients
+```{r}
+aggregate@assays$RNA@scale.data[,1][c(rownames(feature_genes))][-c(1)]
+as.vector(feature_genes['Basophils'][,1][-c(1)])
+```
+## Lets look at the log odds ratio for the cell (change the cell number to compute different cells)
+- The sum of these values is Z and we will take the max value of these values as this will represent the log odds ratio
+```{r}
+cell = 3
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Basophils'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['B-Cells'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['CD8 T Cells'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Chondrocytes'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Developing B-Cells'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Endothelium'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Neutrophil'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['NK Cells'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Platelets and Erythrocytes'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Stromal Cells???'][,1][-c(1)]))))
+exp(sum(unname(aggregate@assays$RNA@scale.data[,cell][c(rownames(feature_genes))][-c(1)]*as.vector(feature_genes['Unknown'][,1][-c(1)]))))
+
+```
+
+## Classify the Cells
+```{r}
+pbmc_cds2 <- classify_cells(agg.cds, pbmc_classifier,
+                           db = org.Mm.eg.db,
+                           cluster_extend = TRUE,
+                           cluster_extend_max_frac_unknown=0.99,
+                           cluster_extend_max_frac_incorrect = 0.1,
+                           cds_gene_id_type = "SYMBOL")
+
+```
+
+## Output some summaries of the classification
+```{r}
+table(pData(pbmc_cds2)$cell_type) %>% kable() %>% kable_styling() 
+table(pData(pbmc_cds2)$cluster_ext_type) %>% kable() %>% kable_styling() 
+```
+
+## Lets see what column names we want to add to the metadata of the seurat object
+```{r}
+colnames(pData((pbmc_cds2)))
+```
+## Add the metadata
+```{r}
+aggregate_new <- AddMetaData(object=aggregate, metadata=as.factor(pData(pbmc_cds2)[c('cell_type')][,1]), col.name = 'cell_type')
+aggregate_new <- AddMetaData(object=aggregate_new, metadata=as.factor(pData(pbmc_cds2)[c('garnett_cluster')][,1]), col.name = 'garnett_cluster')
+aggregate_new <- AddMetaData(object=aggregate_new, metadata=as.factor(pData(pbmc_cds2)[c('cluster_ext_type')][,1]), col.name = 'cluster_ext_type')
+```
+
+
+## Lets look at the resolution that has been important so far again as well as the `cell_type` and `cluster_ext_type`
+```{r}
+Idents(aggregate_new) <- "cell_type"
+
+p <- DimPlot(aggregate_new, label = T, reduction = "umap")
+print(p)
+```
+```{r}
+Idents(aggregate_new) <- "cluster_ext_type"
+
+p <- DimPlot(aggregate_new, label = T, reduction = "umap")
+print(p)
+```
+```{r}
+FeaturePlot(aggregate_new, 'Mmp9')
+```
+
+## Lets output some of the classification to compare with our manual performance of the classification using the coeffecients that we did earlier. 
+```{r}
+aggregate_new$cluster_ext_type[c(1,2,3,4,5,6,7,8,9,10)]
+
+```
+
+
+
+
+The assumptions for Multinomial Logistic Regression include:
+
+Linearity
+No Outliers
+Independence
+No Multicollinearity
+
+
+https://www.statstest.com/multinomial-logistic-regression/
+
+
+Linearity
+Logistic regression fits a logistic curve to binary data. This logistic curve can be interpreted as the probability associated with each outcome across independent variable values. Logistic regression assumes that the relationship between the natural log of these probabilities (when expressed as odds) and your predictor variable is linear.
+
+No Outliers
+The variables that you care about must not contain outliers. Logistic Regression is sensitive to outliers, or data points that have unusually large or small values. You can tell if your variables have outliers by plotting them and observing if any points are far from all other points.
+
+Independence
+Each of your observations (data points) should be independent. This means that each value of your variables doesn’t “depend” on any of the others. For example, this assumption is usually violated when there are multiple data points over time from the same unit of observation (e.g. subject/participant/customer/store), because the data points from the same unit of observation are likely to be related or affect one another.
+
+No Multicollinearity
+Multicollinearity refers to the scenario when two or more of the independent variables are substantially correlated amongst each other. When multicollinearity is present, the regression coefficients and statistical significance become unstable and less trustworthy, though it doesn’t affect how well the model fits the data per se.
