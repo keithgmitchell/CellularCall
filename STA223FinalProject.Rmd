@@ -1,0 +1,594 @@
+---
+title: "STA 223 Final Project"
+author: "Keith Mitchell"
+date: "2/27/2021"
+output: html_document
+---
+
+```{r}
+library(tidyr)
+library(tidyverse)
+require(foreign)
+require(nnet)
+require(ggplot2)
+require(reshape2)
+require(MASS)
+library(nnet)
+library(Seurat)
+library(foreign)
+library(effects)
+library(knitr)  # For knitting document and include_graphics function
+library(ggplot2) # For plotting
+library(png) 
+```
+
+---
+
+# Seurat Object Import
+First a user should start with a seruat object, a fully processed one based on typical seurat processing (reference here)
+```{r}
+aggregate <- readRDS('../keith_analysis_round2/HaudenschildRound2.rds')
+#max(aggregate@assays$RNA[1])
+
+```
+
+
+---
+
+# Testing some code for getting the best candidate cells given a list of important genes for that type
+
+Next we will try a test of getting the top X candidate cells given a certain list for that here referred to as `testing`
+```{r}
+mycolsum = colSums(as.data.frame((aggregate@assays$RNA[c('Sox17', 'Mrpl15')])))
+candidate_labels = labels(mycolsum[order(-mycolsum)][1:300])
+
+
+barcode_cols = colnames(aggregate@assays$RNA)
+#colSums(sapply(aggregate@assays$RNA), decreasing=TRUE)
+aggregate_new <- AddMetaData(object=aggregate, metadata=barcode_cols%in%candidate_labels, col.name = 'testing')
+
+```
+
+
+Lets plot what the testing variable looks like on the UMAP, here it doesnt really cluster because the genes are pretty much raondom for this testing.
+```{r}
+Idents(aggregate_new) <- "testing"
+p <- DimPlot(aggregate_new, label = T, reduction = "umap")
+print(p)
+```
+
+We might want to eventually consider using PC genes for coefficient selection for the other methods like baseline that fail on the full design matrix
+```{r}
+#DimHeatmap(object = aggregate, dims = 1:2)
+#?DimHeatmap
+
+#which.max(aggregate@reductions$pca[,1])
+```
+
+---
+
+# Alright lets turn this into a function and run it for all of the cells in the markers determined by garnett as OK
+- TODO this is not taking into account down regulation!!
+```{r}
+get_max_cell = function(category_name, genes, seurat_object){
+  
+  mycolsum = colSums(as.data.frame((aggregate@assays$RNA[genes])))
+  candidate_labels = labels(mycolsum[order(-mycolsum)][1:100])
+  barcode_cols = colnames(aggregate@assays$RNA)
+  #colSums(sapply(aggregate@assays$RNA), decreasing=TRUE)
+  aggregate_new = AddMetaData(object=seurat_object, metadata=barcode_cols%in%candidate_labels, col.name = category_name)
+  return(aggregate_new)
+}
+```
+
+---
+
+# Get the marker genes for iteratively getting the cell type candidates for training
+- pitfall to consider here. What if the further model has a cell type missing that biases towards another cell type (is that possible, no because of independence?) so what will happen when we classify on this and they are higher prob for it?
+- what will happen if a cell is the max for multiple categories?
+```{r}
+marker_summary = read.csv('../markers_summary.txt')
+marker_summary
+#just want the positive markers not negative for now
+#marker_check = filter(marker_summary, grepl("Ok",summary))
+marker_check = marker_summary %>% filter(summary=="Ok")
+
+marker_check
+
+# actually lets try without worrying about this
+
+```
+
+
+
+Looks like we will need to do some name cleaning and then we can call `get_max_cell`
+```{r}
+for (cell in unique(marker_check$cell_type)){
+
+  df_temp = marker_check %>% filter(cell_type==cell)
+  cell=gsub(" ", ".", cell)
+  cell=gsub("-", ".", cell)
+  print(cell)
+  print(df_temp$marker_gene)
+  aggregate = get_max_cell(cell, df_temp$marker_gene, aggregate)
+}
+```
+
+Then lets create a dimplot of these candidate cells
+```{r}
+cell_list = c()
+for (cell in unique(marker_check$cell_type)){
+  cell=gsub(" ", ".", cell)
+  cell=gsub("-", ".", cell)
+  Idents(aggregate) <- cell
+  
+  p <- DimPlot(aggregate, label = T, reduction = "umap") + ggtitle(cell)
+  print(p)
+  cell_list = c(cell_list, cell)
+
+}
+```
+
+
+
+
+
+---
+# Lets filter the final seurat object and expression matrix to get just the cell candidates that we want to train on and also see all of these graphed at once as the `pre_training_category`
+- So we need one column to represent the heuristic approach and then we need to filter the expression matrix to represent this.
+```{r}
+expression_matrix = t(as.matrix(aggregate@assays$RNA@data))
+
+cell_list
+```
+
+Here we make the columns so we can subset the ones with a classification from those that dont for the 
+- things to consider here is it will take the first max
+- is `1` a fair cutoff for `None` type
+```{r}
+myclassifications = c()
+for (value in seq(1,length(colnames(aggregate@assays$RNA@counts)))){
+  #print((aggregate[[cell_list]][value,]))
+  #print(which.max(as.numeric((aggregate[[cell_list]][value,]))))
+  if (max(as.numeric((aggregate[[cell_list]][value,]))) < 1){
+    myclassifications = c(myclassifications, "None")
+  }
+  else{
+    myclassifications = c(myclassifications, cell_list[which.max(as.numeric((aggregate[[cell_list]][value,])))])
+  }
+}
+table(myclassifications)
+
+```
+
+Add the metadata list:
+```{r}
+aggregate = AddMetaData(object=aggregate, metadata=myclassifications, col.name = 'pre_training_category')
+```
+
+Lets make sure that the TRUE/FALSE for neutrophil make it to the final pre training category:
+```{r}
+length(colnames(aggregate@assays$RNA@counts))
+which(aggregate$pre_training_category == 'Neutrophil')[0:5]
+which(aggregate$Neutrophil == TRUE)[0:5]
+```
+
+Lets check out what the training looks like:
+```{r}
+Idents(aggregate) <- 'pre_training_category'
+p <- DimPlot(aggregate, label = T, reduction = "umap")
+print(p)
+```
+
+
+### Finally lets get a filtered expression matrix for these cells. 
+```{r}
+myclassifications[1:20]
+subset_expression_matrix = which(myclassifications %in% cell_list)
+filtered_expression_matrix = expression_matrix[subset_expression_matrix,]
+predicted_values = myclassifications[! myclassifications %in% c('None')]
+length(predicted_values)
+dim(filtered_expression_matrix)
+```
+
+---
+
+# Training using elastic net regression (Proportional or Baseline?):
+- This will take all of the genes in the design matrix which the other methods can't seem to handle.
+- This is what garnett uses for training, lets use elastic net to determine some coeffecients for a reduced design matrix for testing the proportional and baseline odds models
+- can we add weights to this as the first cell being the most important?
+```{r}
+levels(as.factor(predicted_values))
+```
+# try with different lambdas going into the negative values?
+```{r}
+cvfit <- suppressWarnings(
+  glmnet::cv.glmnet(filtered_expression_matrix, predicted_values,
+                    alpha=.1,
+                    family = "multinomial",
+                    type.multinomial = "grouped",
+                    type.logistic = "modified.Newton",
+                    type.measure="class",
+                    lambda.min.ratio=0.001,
+                    standardize=FALSE,
+                    parallel=FALSE,
+                    thresh=1e-6,
+                    nfolds=3,
+                    nlambda=50))
+                    #penalty.factor = pens))
+
+?cv.glmnet
+```
+
+```{r}
+marker_summary %>% filter(cell_type=='Neutrophil')
+marker_summary %>% filter(cell_type=='Macrophages')
+```
+```{r}
+par(mfrow=c(2,2))
+#install.packages("plotmo")
+library(plotmo)
+fac_labels = levels(as.factor(predicted_values))
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 1, ylab=fac_labels[1])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 2, ylab=fac_labels[2])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 3, ylab=fac_labels[3])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 4, ylab=fac_labels[4])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 5, ylab=fac_labels[5])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 6, ylab=fac_labels[6])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 7, ylab=fac_labels[7])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 8, ylab=fac_labels[8])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 9, ylab=fac_labels[9])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 10, ylab=fac_labels[10])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 11, ylab=fac_labels[11])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 12, ylab=fac_labels[12])
+plot_glmnet(cvfit$glmnet.fit, label=10, nresponse = 13, ylab=fac_labels[13])
+
+#plot(cvfit$glmnet.fit, "lambda", label=TRUE)
+```
+https://stats.stackexchange.com/a/68435/313725
+https://stats.stackexchange.com/a/68435/313725
+
+
+# is it ok that beta and x are switched in the notation from class?
+$$\ln \frac{\Pr(Y_i=2)}{\Pr(Y_i=1)} = \boldsymbol\beta_2 \cdot \mathbf{X}_i = \eta_{i2} = \ln \frac{\pi_{i2}}{\pi_{i1}},$$
+
+
+$$\ln \frac{\Pr(Y_i=M)}{\Pr(Y_i=1)} = \boldsymbol\beta_M \cdot \mathbf{X}_i = \eta_{iM} = \ln \frac{\pi_{iM}}{\pi_{i1}},$$
+
+$$\pi_{ij} = Pr(Y_i=j)$$
+
+
+$$1 = \sum_{j=1}^{M} \pi_{ij} $$
+$$ \pi_{i1} = 1- \sum_{j=2}^M\pi_{ij} = 1 - \sum_{j=2}^M\pi_{ij} \cdot exp(\boldsymbol\beta_M \cdot \mathbf{X}_i)  $$
+# TODO i dont get this....
+
+$$\pi_{i1} = \frac{1}{1+exp(\boldsymbol\beta_M \cdot \mathbf{X}_i)} $$
+
+
+
+$$\pi_{i1} = \frac{1}{1+\sum_{j=2}^Mexp(\eta_{ij})}, \pi_{ij}=\frac{exp(\eta_{ij})}{1+\sum_{j=2}^Mexp(\eta_{ij})}$$
+
+$$ 2 \leq j \leq M $$
+```{r}
+one = 1/(1+exp(0.8))
+two = (exp(0.2)/(1+exp(0.8)))*4
+one
+two
+one+two
+```
+
+
+$$Z = \sum_{k=1}^{K} e^{\boldsymbol\beta_k \cdot \mathbf{X}_i}$$
+
+
+
+$$exp(\eta_{i,j}),$$
+
+```{r}
+library(effects)
+
+mean(filtered_expression_matrix[,c("Lcn2")])
+fit.eff <- Effect("Lcn2", cvfit, given.values = c(value = 0.86))
+
+for (value in c("Lcn2")){
+  print(plot(fit.eff))
+}
+
+```
+
+```{r}
+plotres(cvfit)
+plotmo(cvfit)
+
+autoplot(cvfit)
+```
+
+Plots the cross-validation curve, and upper and lower standard deviation curves, as a function of the lambda values used. If the object has class "cv.relaxed" a different plot is produced, showing both lambda and gamma:
+```{r}
+plot(cvfit)
+```
+
+
+Lets get a nice coeffecient matrix:
+```{r}
+tmp_coeffs <- coef(cvfit, s = "lambda.min")
+tmp_col_name = unlist(tmp_coeffs)
+# https://stats.stackexchange.com/a/410209/313725
+#summary(cvfit)$standard.errors
+#zval.bo <- coef(cvfit, s = "lambda.min") / summary(cvfit)$standard.errors
+# two-sided p-values
+#pval.bo <- 2 * pnorm(abs(zval.bo), lower.tail=FALSE)
+#zval.bo
+#pval.bo
+```
+
+
+
+```{r}
+coef_matrix = as.data.frame(tmp_coeffs)
+colnames(coef_matrix) = ls(tmp_coeffs)
+final_coef_matrix = coef_matrix[rowSums(coef_matrix[,-1])> 0.000000001,]
+final_coef_matrix
+```
+
+
+
+---
+
+# Run the prediction
+
+```{r}
+prediction = predict(cvfit, newx = expression_matrix, s = "lambda.min")
+prediction_prob = predict(cvfit, newx = expression_matrix, s = "lambda.min", type="response")
+```
+
+Get the predictions of highest prob:
+```{r}
+new_cell_labels = colnames(prediction)[apply(prediction,1,which.max)]
+new_cell_labels[0:5]
+```
+
+Get the highest probablity for each of the classifications:
+```{r}
+cell_probs = unlist(apply(prediction_prob,1,max))
+cell_probs[1:5]
+```
+
+Add the new info from running predict to the seurat object:
+```{r}
+aggregate = AddMetaData(object=aggregate, metadata=as.factor(new_cell_labels), col.name = 'post_training_category')
+aggregate = AddMetaData(object=aggregate, metadata=cell_probs, col.name = 'prediction_prob')
+```
+
+
+Finally lets visualize the final classification:
+
+```{r}
+Idents(aggregate) <- "post_training_category"
+p <- DimPlot(aggregate, label = T, reduction = "umap")
+print(p)
+```
+
+```{r}
+Idents(aggregate) <- "post_training_category"
+p <- DimPlot(aggregate, label = T, reduction = "umap", split.by = "orig.ident")
+print(p)
+```
+
+Graph some markers and the probability of a given prediction:
+```{r}
+#Idents(aggregate) <- "prediction_prob"
+p <- FeaturePlot(aggregate, "prediction_prob", label = T, reduction = "umap")
+print(p)
+p <- FeaturePlot(aggregate, "Mmp9", label = T, reduction = "umap")
+print(p)
+```
+
+```{r}
+Idents(aggregate) <- "RNA_snn_res.0.1"
+p <- DimPlot(aggregate, label = T, reduction = "umap")
+print(p)
+```
+
+```{r}
+Idents(aggregate) <- "RNA_snn_res.0.1"
+p <- DimPlot(aggregate, label = T, reduction = "umap", split.by="orig.ident")
+print(p)
+```
+
+```{r}
+Idents(aggregate) <- "RNA_snn_res.0.2"
+p <- DimPlot(aggregate, label = T, reduction = "umap")
+print(p)
+```
+
+
+```{r}
+Idents(aggregate) <- "RNA_snn_res.0.3"
+p <- DimPlot(aggregate, label = T, reduction = "umap")
+print(p)
+```
+
+
+
+
+
+
+
+
+
+---
+
+# Ok now lets try a couple models from the course and see how it looks
+- we will use the elastic net coef selection here since otherwise it fails
+- baseline odds
+```{r}
+#predicted_values
+#rownames(final_coef_matrix)
+#filtered_expression_matrix[,rownames(final_coef_matrix)]
+test = multinom(predicted_values ~ ., data=as.data.frame(filtered_expression_matrix[,rownames(final_coef_matrix)]))
+#summary(test)
+?cv.glmnet
+```
+
+
+```{r}
+library(glm.predict)
+install.packages("glm.predict")
+dim(expression_matrix)
+head(expression_matrix[,rownames(final_coef_matrix)])
+prd_prob_baseline = predict(test, newdata=expression_matrix[,rownames(final_coef_matrix)], type='prob')
+prd_lb_baseline = predict(test, newdata=expression_matrix[,rownames(final_coef_matrix)])
+```
+
+
+```{r}
+baseline_cell_probs = unlist(apply(prd_prob_baseline,1,max))
+head(baseline_cell_probs)
+length(baseline_cell_probs)
+head(prd_lb_baseline)
+length(prd_lb_baseline)
+```
+
+
+```{r}
+aggregate = AddMetaData(object=aggregate, metadata=as.factor(prd_lb_baseline), col.name = 'baseline_classification')
+aggregate = AddMetaData(object=aggregate, metadata=baseline_cell_probs, col.name = 'baseline_prob')
+```
+
+
+```{r}
+Idents(aggregate) <- "baseline_classification"
+p <- DimPlot(aggregate, label = T, reduction = "umap")
+print(p)
+```
+
+Graph some markers and the probability of a given prediction:
+```{r}
+#Idents(aggregate) <- "prediction_prob"
+p <- FeaturePlot(aggregate, "baseline_prob", label = T, reduction = "umap")
+print(p)
+p <- FeaturePlot(aggregate, "Mmp9", label = T, reduction = "umap")
+print(p)
+```
+
+
+
+
+```{r}
+mean(filtered_expression_matrix[,c("Ccl4")])
+
+fit.eff <- Effect("Ccl4", test, given.values = c('test' = 0.90))
+plot(fit.eff)
+```
+
+
+
+
+https://community.rstudio.com/t/understanding-glmnets-multinomial-logistic-regression-coefficients-not-k-1/52031
+
+https://stats.stackexchange.com/questions/462022/on-what-basis-do-i-set-the-baseline-for-a-multinomial-logistic-regression-model?newreg=6128a97cddae4cbe9f4e36fcbe6ce6ff
+
+https://stackoverflow.com/a/33782284/7305166
+
+---
+
+
+# Run the prediction
+
+- This data is also hosted here for further exploration: [Shiny App](http://ec2-54-219-38-77.us-west-1.compute.amazonaws.com:3838/scRNA_shiny/)
+```{r}
+aggregate2 <- readRDS('../Haudenschild_scRNASeqfromapp.rds')
+expression_matrix = t(as.matrix(aggregate2@assays$RNA@data))
+print('p')
+```
+
+
+```{r}
+rownames(final_coef_matrix)
+new_coef_names = rownames(final_coef_matrix)[rownames(final_coef_matrix) %in% colnames(expression_matrix)]
+missing_coef_names = rownames(final_coef_matrix)[!(rownames(final_coef_matrix) %in% colnames(expression_matrix))]
+new_coef_names
+missing_coef_names
+dim(expression_matrix[,new_coef_names])
+expression_matrix$Ecrg4 = 0
+expression_matrix$Ccn2 = 0
+```
+
+
+
+
+
+```{r}
+dim(expression_matrix)
+prediction=predict(cvfit, newx = expression_matrix[,rownames(final_coef_matrix)], s = "lambda.min")
+prediction_prob = predict(cvfit, newdata = expression_matrix[,rownames(final_coef_matrix)], s = "lambda.min", type="response")
+```
+
+
+
+Get the predictions of highest prob:
+```{r}
+new_cell_labels = colnames(prediction)[apply(prediction,1,which.max)]
+new_cell_labels[0:5]
+```
+
+Get the highest probablity for each of the classifications:
+```{r}
+cell_probs = unlist(apply(prediction_prob,1,max))
+cell_probs[1:5]
+```
+
+Add the new info from running predict to the seurat object:
+```{r}
+aggregate2 = AddMetaData(object=aggregate2, metadata=as.factor(new_cell_labels), col.name = 'post_training_category')
+aggregate = AddMetaData(object=aggregate2, metadata=cell_probs, col.name = 'prediction_prob')
+```
+
+
+Finally lets visualize the final classification:
+```{r}
+Idents(aggregate2) <- "post_training_category"
+p <- DimPlot(aggregate2, label = T, reduction = "umap")
+print(p)
+```
+
+
+
+---
+
+
+# Extra Stuff
+
+
+
+```{r}
+library(MASS)
+data(housing)
+house.plr = polr(Sat ~ Infl + Type + Cont, weight=Freq, data=housing)
+housing
+```
+```{r}
+summary(house.plr)
+```
+
+
+
+```{r}
+        cvfit <- suppressWarnings(
+          glmnet::cv.glmnet(x, y, lambda = lambdas,
+                            weights=obs_weights[y],
+                            alpha=.3,
+                            family = "multinomial",
+                            type.multinomial = "grouped",
+                            type.logistic = "modified.Newton",
+                            type.measure="class",
+                            lambda.min.ratio=0.001,
+                            standardize=FALSE,
+                            parallel=FALSE,
+                            thresh=1e-6,
+                            nfolds=3,
+                            nlambda=50,
+                            penalty.factor = pens))
+      }
+```
